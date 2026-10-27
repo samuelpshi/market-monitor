@@ -1,0 +1,78 @@
+# Databricks Asset Bundle. Deploy with:
+#   databricks bundle deploy -t dev
+#   databricks bundle run market_data_monitor -t dev
+# Secrets (scope "market-monitor"): alpha_vantage_api_key, anthropic_api_key, slack_webhook_url
+#   databricks secrets create-scope market-monitor
+#   databricks secrets put-secret market-monitor alpha_vantage_api_key
+bundle:
+  name: market-data-monitor
+
+variables:
+  notify_email:
+    description: Where job-failure emails go
+    default: you@example.com
+
+resources:
+  jobs:
+    market_data_monitor:
+      name: market-data-monitor
+      # 18:30 New York, weekdays: after the 16:00 close and Yahoo's end-of-day
+      # settle. Holidays rerun the previous session idempotently; the digest
+      # step will not repost a digest already sent for that session.
+      schedule:
+        quartz_cron_expression: "0 30 18 ? * MON-FRI"
+        timezone_id: America/New_York
+        pause_status: UNPAUSED
+      max_concurrent_runs: 1
+      email_notifications:
+        on_failure: ["${var.notify_email}"]
+      environments:
+        - environment_key: default
+          spec:
+            client: "2"
+            dependencies:
+              - pyyaml
+              - yfinance
+              - exchange_calendars
+              - anthropic
+              - requests
+      tasks:
+        - task_key: ingest
+          environment_key: default
+          max_retries: 2
+          min_retry_interval_millis: 300000
+          spark_python_task:
+            python_file: ./jobs/run_step.py
+            parameters: ["--step", "ingest"]
+        - task_key: quality
+          depends_on: [{task_key: ingest}]
+          environment_key: default
+          spark_python_task:
+            python_file: ./jobs/run_step.py
+            parameters: ["--step", "quality"]
+        - task_key: reconcile
+          depends_on: [{task_key: ingest}]
+          environment_key: default
+          spark_python_task:
+            python_file: ./jobs/run_step.py
+            parameters: ["--step", "reconcile"]
+        - task_key: anomalies
+          # reads prices_clean, which depends on both quality and reconcile flags
+          depends_on: [{task_key: quality}, {task_key: reconcile}]
+          environment_key: default
+          spark_python_task:
+            python_file: ./jobs/run_step.py
+            parameters: ["--step", "anomalies"]
+        - task_key: digest
+          depends_on: [{task_key: anomalies}]
+          environment_key: default
+          spark_python_task:
+            python_file: ./jobs/run_step.py
+            parameters: ["--step", "digest"]
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://<your-workspace>.cloud.databricks.com
