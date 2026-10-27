@@ -69,15 +69,20 @@ def main(argv=None):
     ap.add_argument("--step", default="all", choices=STEPS + ["all"])
     ap.add_argument("--as-of", type=date.fromisoformat, default=None)
     ap.add_argument("--config", default=None)
+    ap.add_argument("--namespace", default=None, help="catalog.schema for Spark tables (overrides config)")
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--demo", action="store_true",
                     help="synthetic market; runs the prior session first so day-over-day checks have history")
     ap.add_argument("--no-llm", action="store_true")
     ap.add_argument("--no-post", action="store_true")
+    ap.add_argument("--post", choices=["yes", "no"], default="yes", help="for job configs; --post no == --no-post")
     a = ap.parse_args(argv)
+    a.no_post = a.no_post or a.post == "no"
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     cfg = load_config(a.config)
+    if a.namespace:
+        cfg["storage"]["spark_namespace"] = a.namespace
     as_of = a.as_of or last_completed_session()
     if as_of not in sessions(CALENDAR_START, as_of):
         raise SystemExit(f"{as_of} is not an NYSE session; pass a session date")

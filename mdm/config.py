@@ -7,9 +7,12 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def load_config(path: str | None = None) -> dict:
-    path = path or os.environ.get("MDM_CONFIG") or ROOT / "config.yaml"
+    path = path or os.environ.get("MDM_CONFIG") or Path(__file__).parent / "config.yaml"
     with open(path) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    if os.environ.get("MDM_SPARK_NAMESPACE"):
+        cfg["storage"]["spark_namespace"] = os.environ["MDM_SPARK_NAMESPACE"]
+    return cfg
 
 
 def _load_dotenv(path: Path = ROOT / ".env") -> None:

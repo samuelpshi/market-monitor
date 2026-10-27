@@ -10,7 +10,19 @@ bundle:
 variables:
   notify_email:
     description: Where job-failure emails go
-    default: you@example.com
+    default: samuelshi007@gmail.com
+  post_digest:
+    description: Post the digest to Slack (dev test runs default to no)
+    default: "yes"
+  namespace:
+    description: Unity Catalog catalog.schema for the tables (Free Edition's catalog is "workspace")
+    default: workspace.market_monitor
+
+artifacts:
+  mdm_wheel:
+    type: whl
+    build: uv build --wheel
+    path: .
 
 resources:
   jobs:
@@ -31,11 +43,15 @@ resources:
           spec:
             client: "2"
             dependencies:
+              # pin to the numpy-1.x ABI the serverless image's pandas/pyarrow were built for
+              - numpy<2
+              - pandas>=2.1,<2.3
               - pyyaml
               - yfinance
               - exchange_calendars
               - anthropic
               - requests
+              - ./dist/*.whl
       tasks:
         - task_key: ingest
           environment_key: default
@@ -43,36 +59,45 @@ resources:
           min_retry_interval_millis: 300000
           spark_python_task:
             python_file: ./jobs/run_step.py
-            parameters: ["--step", "ingest"]
+            parameters: ["--root", "${workspace.file_path}", "--step", "ingest", "--namespace", "${var.namespace}"]
         - task_key: quality
           depends_on: [{task_key: ingest}]
           environment_key: default
           spark_python_task:
             python_file: ./jobs/run_step.py
-            parameters: ["--step", "quality"]
+            parameters: ["--root", "${workspace.file_path}", "--step", "quality", "--namespace", "${var.namespace}"]
         - task_key: reconcile
           depends_on: [{task_key: ingest}]
           environment_key: default
           spark_python_task:
             python_file: ./jobs/run_step.py
-            parameters: ["--step", "reconcile"]
+            parameters: ["--root", "${workspace.file_path}", "--step", "reconcile", "--namespace", "${var.namespace}"]
         - task_key: anomalies
           # reads prices_clean, which depends on both quality and reconcile flags
           depends_on: [{task_key: quality}, {task_key: reconcile}]
           environment_key: default
           spark_python_task:
             python_file: ./jobs/run_step.py
-            parameters: ["--step", "anomalies"]
+            parameters: ["--root", "${workspace.file_path}", "--step", "anomalies", "--namespace", "${var.namespace}"]
         - task_key: digest
           depends_on: [{task_key: anomalies}]
           environment_key: default
           spark_python_task:
             python_file: ./jobs/run_step.py
-            parameters: ["--step", "digest"]
+            parameters: ["--root", "${workspace.file_path}", "--step", "digest", "--namespace", "${var.namespace}", "--post", "${var.post_digest}"]
 
 targets:
+  # dev: development mode prefixes names and PAUSES the schedule; use for test runs.
   dev:
     mode: development
     default: true
+    variables:
+      post_digest: "no"
     workspace:
-      host: https://<your-workspace>.cloud.databricks.com
+      host: https://dbc-2c0ef95b-cd08.cloud.databricks.com
+  # prod: schedule is live (weekdays 18:30 New York).
+  prod:
+    mode: production
+    workspace:
+      host: https://dbc-2c0ef95b-cd08.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}

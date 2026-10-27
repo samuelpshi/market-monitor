@@ -126,6 +126,8 @@ class SparkEngine(Engine):
 
 
 def get_engine(cfg: dict) -> Engine:
+    import os
+
     st = cfg["storage"]
     try:
         from pyspark.sql import SparkSession  # type: ignore
@@ -133,7 +135,10 @@ def get_engine(cfg: dict) -> Engine:
         spark = SparkSession.getActiveSession()
     except ImportError:
         spark = None
-    if spark is not None or st["engine"] == "spark":
+    # In a Databricks job task the session may not be "active" yet; never fall
+    # back to DuckDB there, or results land on the ephemeral driver disk.
+    on_databricks = "DATABRICKS_RUNTIME_VERSION" in os.environ
+    if spark is not None or on_databricks or st["engine"] == "spark":
         if spark is None:
             from pyspark.sql import SparkSession  # type: ignore
 
