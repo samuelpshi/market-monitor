@@ -1,0 +1,55 @@
+# Market Data Monitor configuration.
+# 50 tickers. Alpha Vantage's free tier allows ~25 requests/day, so the second
+# vendor is rotated (see ingest.secondary_daily_budget).
+watchlist: [AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA, AVGO, JPM, V,
+            MA, UNH, XOM, CVX, JNJ, PG, HD, COST, ABBV, MRK,
+            PEP, KO, BAC, WFC, GS, MS, NFLX, ADBE, CRM, ORCL,
+            AMD, INTC, CSCO, QCOM, TXN, IBM, CAT, DE, BA, GE,
+            LMT, NKE, MCD, SBUX, DIS, WMT, T, VZ, SPY, QQQ]
+
+storage:
+  # "duckdb" for local runs, "spark" on Databricks (auto-detected when a
+  # SparkSession is active).
+  engine: duckdb
+  duckdb_path: data/market_monitor.duckdb
+  duckdb_schema: mm
+  spark_namespace: main.market_monitor   # catalog.schema in Unity Catalog
+
+ingest:
+  history_days: 400          # first load; later runs only fetch a short window
+  incremental_days: 10       # refetch window so late corrections overwrite
+  secondary_daily_budget: 24 # Alpha Vantage calls/day (free tier ~25)
+  max_expiries: 4            # option expiries pulled per ticker
+  expiry_targets_days: [14, 30, 60, 90]  # nearest listed expiry to each DTE
+  options_tickers: [AAPL, MSFT, NVDA, AMZN, META, TSLA, JPM, XOM, SPY, QQQ]
+  risk_free_symbol: ^IRX     # 13-week T-bill yield (percent)
+
+checks:
+  stale_repeat_days: 2       # identical close+volume for N consecutive sessions
+  missing_lookback_sessions: 60
+  parity:
+    min_days_to_expiry: 7
+    moneyness_min: 0.85
+    moneyness_max: 1.15
+    min_open_interest: 10
+    abs_tolerance: 0.05      # dollars, on top of half-spreads
+    spot_tolerance_pct: 0.002  # covers spot/option snapshot timing skew
+  stale_quote:
+    min_spot_move: 0.01        # only judge staleness when spot moved >= 1%
+    min_share: 0.25            # share of near-money quotes unchanged
+
+reconciliation:
+  warn_bps: 10
+  break_bps: 50
+  lookback_sessions: 20
+
+anomalies:
+  vol_window: 20
+  long_window: 250
+  z_threshold: 3.0
+  vol_ratio_threshold: 2.0
+
+digest:
+  model: claude-opus-5-5
+  effort: low
+  max_retries: 1             # LLM rewrites after a failed figure check
