@@ -1,112 +1,138 @@
 # Market Data Monitor
 
-Catches bad market data and unusual price moves before they reach research.
-Daily prices and options chains for a 50-ticker watchlist land in Databricks
-(or DuckDB locally) on a scheduled Job. SQL checks flag stale prices and stale
-quotes, missing sessions, malformed bars, crossed quotes, put-call parity breaks
-and breaks between two data vendors. Rolling-volatility / z-score signals flag
-unusual moves. Claude drafts a daily digest for Slack, and code verifies every
-figure in it against the flags table before it posts. A Streamlit dashboard
-shows all of it.
+A daily pipeline that catches bad market data and unusual price moves before they reach research.
+
+It pulls prices for a 50-ticker watchlist and options chains for 10 of them, then flags:
+- stale prices and stale quotes
+- missing sessions and malformed bars
+- crossed quotes
+- put-call parity breaks
+- disagreements between two data vendors
+- abnormal returns
+
+Flagged bars are kept out of the dataset research reads. Claude writes a daily Slack digest, and code checks every figure in it against the data before it posts.
+
+**Stack:** Python · SQL (Spark SQL / DuckDB) · Databricks Jobs · Claude API · Slack · Streamlit
 
 ```
-Yahoo (prices, options) ─┐
-Alpha Vantage (rotated) ─┼─> ingest ─> quality SQL ──┐
-                         │            reconcile SQL ─┼─> flags ─> prices_clean ─> anomalies ─> digest ─> Slack
-                         │                           │                                         │
-                         └───────────────────────────┴──────────── Streamlit dashboard <───────┘
+ Yahoo Finance ──┐                 ┌─ quality checks (SQL) ─┐
+ (prices, opts)  ├─> ingest ──────>┤                        ├─> flags ─> prices_clean ─> anomalies ─> digest ─> Slack
+ Alpha Vantage ──┘                 └─ vendor reconcile (SQL)┘                                │
+ (2nd vendor)                                                                                │
+                                         Streamlit dashboard <───────────────────────────────┘
 ```
 
-## Quick start (local, no API keys)
+## Results
+
+**Detection, measured with a fault-injection harness** (`mdm/harness.py`)
+
+The harness plants random faults into a synthetic 50-ticker market and runs the real checks against them. Fault sizes are drawn on both sides of each check's threshold, so it measures both what the checks catch and what they miss.
+
+| | |
+|---|---|
+| Faults planted | 510, across 8 fault types |
+| Recall, faults at or above each check's threshold | **100% (385 / 385)** |
+| Recall, all faults, including deliberately sub-threshold ones | 76% |
+| False flags on clean data | 4.5 per 50-ticker run, mostly vendor noise crossing the 10 bps threshold |
+
+**Live run on real data (2026-10-26)**
+- Ingested 13,800 daily bars for all 50 tickers and 8,482 option quotes.
+- Reconciled 24 tickers against the second vendor.
+- Raised 6 flags. One was a SPY Dec $658 call quoted above the $650 call. A higher-strike call can never be worth more, so that quote is provably bad.
+- Yahoo and Alpha Vantage closes never differed by more than 0.5 bps across 2,400 overlapping bars. Real vendor noise is far below the simulated noise, but the two vendors probably share an upstream feed (see [Limitations](#limitations)).
+
+## Checks
+
+All checks are SQL in [`mdm/sql/`](mdm/sql), written in the subset that runs on both Spark SQL (Databricks) and DuckDB (local).
+
+| Check | Flags |
+|---|---|
+| `stale_latest` | Latest bar is older than the latest completed NYSE session |
+| `stale_repeat` | Close **and** volume unchanged for 2+ sessions (a carried-forward bar) |
+| `missing_day` | An NYSE session with no bar. Holidays come from `exchange_calendars`, so they aren't false hits |
+| `bad_ohlc` | Close or open outside the high–low range, high below low, or a non-positive price |
+| `crossed_quote` | Option bid above ask. Locked and one-sided quotes are flagged at low severity |
+| `stale_quote` | An option chain unchanged since the last snapshot while spot moved at least 1% |
+| `put_call_parity` | C − P outside the **American** no-arbitrage bounds `S·e^(−qT) − K ≤ C − P ≤ S − K·e^(−rT)`, beyond both legs' half-spreads plus a timing buffer |
+| `recon_break` | Primary and secondary vendor close differ by ≥10 bps (≥50 bps is high severity). Ratios near 2, 3 or ½ are tagged as likely split-adjustment mismatches |
+| `return_zscore` | Today's return is ≥3σ against the *prior* 20-day volatility |
+| `vol_regime` | 20-day volatility is at least 2× the 250-day volatility |
+
+## Design decisions
+
+- **Flags gate the data, they don't just report on it.** Research reads `prices_clean`, a view that excludes bad bars, every session of a stale run, and high-severity vendor breaks. Anomaly signals are also computed from `prices_clean`, so a bad print can't show up as a big move.
+- **American bounds, not the European equality.** US single-stock options are American, so checking `C − P = S − K·e^(−rT)` would flag every early-exercise premium as an error.
+- **Root causes over symptoms.** A stale chain breaks parity on every strike. When a chain is flagged stale, its parity flags are demoted so the digest reports one problem, not 20.
+- **Expiries are chosen by days to expiry.** SPY and QQQ list daily expiries, so "the first 4 expiries" are all under a week out. Parity skips those, and on the first live run that meant 0 contracts were tested. The pipeline now picks the listed expiry nearest to 14, 30, 60 and 90 days.
+- **The LLM never posts an unchecked number.** `verify()` checks each draft line by line:
+  - every figure matches the data for the one ticker named on that line
+  - every contract reference matches a flagged contract exactly
+  - dates are ISO and appear in the data
+  - "up" or "down" agrees with the sign of the return
+  - every high-severity item is covered
+  - there are no self-corrections
+
+  A draft that fails gets one rewrite with the errors fed back. If it fails again, a deterministic template digest is posted instead.
+- **Reruns are safe.** Every write deletes its slice and then inserts. A digest already posted for a session is never reposted.
+- **The second vendor is rotated.** Alpha Vantage's free tier allows about 25 calls a day, so 24 tickers are reconciled each session and every ticker is covered at least once every 3 sessions.
+
+## Run it
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m mdm.pipeline --demo --as-of 2026-10-23 --no-post   # synthetic market with planted faults
-.venv/bin/python -m mdm.harness --batches 12                           # measure recall / false positives
+
+# Synthetic market with planted faults, no keys needed
+.venv/bin/python -m mdm.pipeline --demo --as-of 2026-10-23 --no-post
+
+# Measure detection recall and false positives
+.venv/bin/python -m mdm.harness --batches 12
+
 .venv/bin/python -m pytest -q tests
 .venv/bin/streamlit run app/streamlit_app.py
 ```
 
-Live data: `python -m mdm.pipeline` (defaults to the latest completed NYSE session).
-Set `ALPHA_VANTAGE_API_KEY`, `ANTHROPIC_API_KEY` and `SLACK_WEBHOOK_URL` as env vars,
-or in Databricks secret scope `market-monitor`.
+For live data, copy `.env.example` to `.env` and fill in `ALPHA_VANTAGE_API_KEY`, `ANTHROPIC_API_KEY` and `SLACK_WEBHOOK_URL`. Then run:
 
-## Databricks
+```bash
+.venv/bin/python -m mdm.pipeline              # latest completed NYSE session
+.venv/bin/python -m mdm.pipeline --no-post    # draft the digest without posting
+```
 
-`databricks.yml` is an Asset Bundle: a five-task serverless Job (ingest → quality and
-reconcile in parallel → anomalies → digest), running weekdays at 18:30 New York time.
+### Databricks
+
+[`databricks.yml`](databricks.yml) is an Asset Bundle that defines a serverless Job with five tasks: ingest, then quality and reconcile in parallel, then anomalies, then digest. The `prod` target runs weekdays at 18:30 New York time. The `dev` target keeps the schedule paused and doesn't post to Slack. The Job writes Delta tables to `workspace.market_monitor` (Free Edition's catalog; override with `var.namespace`), and keys come from the secret scope `market-monitor`. It has run end-to-end on Databricks Free Edition serverless.
 
 ```bash
 databricks secrets create-scope market-monitor
 databricks secrets put-secret market-monitor alpha_vantage_api_key   # also anthropic_api_key, slack_webhook_url
-databricks bundle deploy -t dev && databricks bundle run market_data_monitor -t dev
+databricks bundle deploy -t dev
+databricks bundle run market_data_monitor -t dev   # test run
+databricks bundle deploy -t prod                    # turn on the daily schedule
 ```
 
-Tables go to `main.market_monitor` (set `storage.spark_namespace`). The same SQL files run
-on both engines. The tests parse them as Spark SQL, but nothing has been run on a cluster yet.
+## Project layout
 
-## Checks
+```
+mdm/
+  sources.py     Yahoo, Alpha Vantage, and a synthetic market with planted faults
+  ingest.py      idempotent loads, vendor rotation
+  sql/           quality checks, reconciliation, prices_clean view
+  checks.py      runs the SQL checks and writes flags
+  anomalies.py   rolling volatility and z-scores on prices_clean
+  digest.py      facts → Claude draft → verify → Slack
+  harness.py     fault injection: recall and false-positive rate
+  engine.py      DuckDB / Spark storage behind one interface
+  pipeline.py    CLI and job entry point
+app/             Streamlit dashboard
+jobs/            Databricks task entry point
+tests/           planted-fault, idempotency, verifier, Spark-SQL-parse tests
+```
 
-| Check | Stage | What it flags |
-|---|---|---|
-| `stale_latest` | quality | latest bar older than the latest completed session |
-| `stale_repeat` | quality | identical close **and** volume for ≥2 consecutive sessions (carried-forward bars) |
-| `missing_day` | quality | NYSE session with no bar (exchange_calendars, so holidays aren't false hits) |
-| `bad_ohlc` | quality | close/open outside high–low, high < low, non-positive price |
-| `crossed_quote` / `locked_quote` / `one_sided_quote` | quality | option bid > ask / bid = ask / bid with no ask |
-| `stale_quote` | quality | option chain unchanged since the prior snapshot while spot moved ≥1% |
-| `put_call_parity` | quality | C − P outside the **American** bounds S·e^(−qT) − K ≤ C − P ≤ S − K·e^(−rT), beyond half-spreads + buffers |
-| `recon_break` | reconciliation | primary vs secondary close ≥10 bps (≥50 bps = high); ratios of 2, 3, ½… tagged as split-adjustment mismatches |
-| `return_zscore` / `vol_regime` | anomaly | \|z\| ≥ 3 vs the prior 20-day vol; 20d / 250d vol ≥ 2 |
+## Limitations
 
-Research reads `prices_clean`, which excludes bars flagged `bad_ohlc`, every session of a
-`stale_repeat` run, and high-severity vendor breaks. Anomalies are computed on
-`prices_clean`, so a bad bar can't register as a big move.
-
-## LLM digest
-
-`mdm/digest.py` builds a facts JSON from the flags, with every figure pre-formatted.
-Claude (`claude-opus-5-5`, low effort, server-side refusal fallback enabled) writes the
-Slack message. `verify()` then checks it line by line:
-- every number matches a figure for a ticker named on that line
-- dates are ISO and appear in the data
-- "up"/"down" agrees with the sign of the return
-- every high-severity item is mentioned
-- no ticker without flags is mentioned
-
-On failure the errors go back to Claude for one rewrite. If that also fails, a
-deterministic template digest is posted instead, so an unverified number never reaches
-Slack. Each run is stored in `digests` with its verification result. A digest already
-posted for a session is not reposted.
-
-## Measured detection (synthetic, `mdm.harness`)
-
-510 faults planted across 12 batches, at most one per ticker per batch. Fault sizes were
-drawn on both sides of each threshold, and there were 6 clean runs with no plants.
-
-- **Recall on faults at or above each check's threshold: 100% (385/385).**
-- Recall on all planted faults, including deliberately sub-threshold ones: 76%.
-- False flags on clean data: 4.5 per run (50 tickers). 24 of the 27 were `recon_break`,
-  caused by simulated vendor noise crossing the 10 bps threshold. The other 3 were
-  genuine 3σ moves in the simulated returns.
-
-These numbers come from a synthetic market. Real vendor disagreement and quote quality
-will produce different false-positive rates. Measure on live data before quoting a
-precision figure.
-
-## Known limitations
-
-- **yfinance** scrapes Yahoo's unofficial API. It breaks without notice, throttles, and
-  Yahoo's terms restrict this use. Options quotes are delayed and not synchronized with the
-  spot snapshot. That's why parity has a spot-timing buffer, and why deep in-the-money
-  contracts still produce flags that are hard to adjudicate.
-- **Alpha Vantage free tier** allows about 25 calls a day. With 50 tickers the second vendor
-  is rotated 24 per day, so a vendor break can take up to 3 sessions to surface.
-  `TIME_SERIES_DAILY` is as-traded while Yahoo's `Close` is split-adjusted, so pre-split
-  history disagrees (tagged low severity).
-- **Databricks serverless egress**: outbound calls to Yahoo and Alpha Vantage may be blocked
-  by workspace network policy (Free Edition in particular). If so, run ingest outside
-  Databricks and land files in a Volume.
-- Dividend yield is trailing-12-month cash dividends / spot. The risk-free rate is ^IRX.
-  Both are approximations that are good enough for bounds checks, not for pricing.
-- The live Claude call and Slack posting are covered by tests with a fake client only.
+- **yfinance** wraps Yahoo's unofficial API. It can break or throttle without notice, and Yahoo's terms restrict this use. Option quotes are delayed and not in sync with the spot snapshot, so deep in-the-money contracts with wide markets still raise parity flags that are hard to judge.
+- **The two vendors may not be independent.** Closes agreeing to within 0.5 bps everywhere suggests a shared upstream feed. The reconciliation then catches errors in fetching or storing data, not errors in the source data itself. A truly independent second source would make it stronger.
+- **Pre-split history disagrees between vendors.** Alpha Vantage's free daily series is as-traded, while Yahoo's close is split-adjusted. The mismatch is detected and tagged rather than corrected.
+- **The harness figures are synthetic.** Recall and false-positive rates come from a simulated market. Real false-positive rates need to be tracked on live runs over time.
+- **Serverless packaging.** Databricks serverless can't import modules from bundle workspace files, so the job installs `mdm` as a wheel built by the bundle. NumPy is pinned below 2 to match the ABI of the image's preinstalled pandas and pyarrow.
+- **Dividend yield and the risk-free rate are approximations.** Dividend yield is trailing-12-month cash dividends over spot, and the rate is the 13-week T-bill yield (^IRX). That's adequate for bounds checks, not for pricing.
